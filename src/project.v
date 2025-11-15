@@ -20,7 +20,7 @@ module tt_um_benpayne_ps2_decoder (
 
   // All output pins must be assigned. If not used, assign to 0.
   assign uio_oe = cs ? 8'b11111111 : 8'b00000000; // uio_out[7:0] are always outputs when CS active
-  assign uo_out[7:4] = 4'b0000; // uo_out[7:4] set to always 0
+  assign uo_out[7:5] = 3'b000; // uo_out[7:5] set to always 0
 
   // List all unused inputs to prevent warnings
   wire _unused = &{ena, uio_in, ui_in[7:4], 1'b0};
@@ -39,6 +39,24 @@ module tt_um_benpayne_ps2_decoder (
   reg cs_trigger;
   reg cs_stable;  // Require 2 stable cycles before triggering
 
+  // UART TX signals
+  wire uart_tx;
+  reg uart_tx_start;
+  reg [7:0] uart_tx_data;
+  wire uart_tx_busy;
+
+  // UART transmission state machine
+  localparam UART_IDLE          = 3'd0;
+  localparam UART_CAPTURE_STATUS= 3'd1;
+  localparam UART_SEND_STATUS   = 3'd2;
+  localparam UART_WAIT_STATUS   = 3'd3;
+  localparam UART_SEND_DATA     = 3'd4;
+  localparam UART_WAIT_DATA     = 3'd5;
+
+  reg [2:0] uart_state;
+  reg [7:0] captured_status;
+  reg [7:0] captured_data;
+
   assign int_clear = ui_in[2];
   assign cs = ui_in[3];
 
@@ -46,6 +64,7 @@ module tt_um_benpayne_ps2_decoder (
   assign uo_out[1] = interupt;
   assign uo_out[2] = ~data_rdy;
   assign uo_out[3] = fifo_full;  // FIFO overflow indicator
+  assign uo_out[4] = uart_tx;    // UART TX output for debugging
 
   // CS edge detection with glitch filtering
   // Requires CS to be stable high for 2 cycles after rising edge before triggering read
@@ -76,6 +95,67 @@ module tt_um_benpayne_ps2_decoder (
       else begin
         cs_trigger <= 0;
       end
+    end
+  end
+
+  // UART TX state machine: sends status byte + data byte when PS/2 valid pulse occurs
+  always @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+      uart_state <= UART_IDLE;
+      uart_tx_start <= 0;
+      uart_tx_data <= 8'd0;
+      captured_status <= 8'd0;
+      captured_data <= 8'd0;
+    end else begin
+      case (uart_state)
+        UART_IDLE: begin
+          uart_tx_start <= 0;
+          if (valid) begin
+            // Capture data immediately when valid pulses
+            captured_data <= ps2_key_data;
+            // Move to capture status state to wait for interrupt/fifo signals to settle
+            uart_state <= UART_CAPTURE_STATUS;
+          end
+        end
+
+        UART_CAPTURE_STATUS: begin
+          // Wait one cycle for interrupt and fifo_full signals to settle
+          uart_state <= UART_SEND_STATUS;
+        end
+
+        UART_SEND_STATUS: begin
+          // Send the status byte (signals have now settled)
+          captured_status <= {4'b0, fifo_full, ~data_rdy, interupt, 1'b1};
+          uart_tx_data <= {4'b0, fifo_full, ~data_rdy, interupt, 1'b1};
+          uart_tx_start <= 1;
+          uart_state <= UART_WAIT_STATUS;
+        end
+
+        UART_WAIT_STATUS: begin
+          uart_tx_start <= 0;
+          // Wait for UART to finish transmitting status byte
+          if (!uart_tx_busy && uart_tx_start == 0) begin
+            uart_state <= UART_SEND_DATA;
+          end
+        end
+
+        UART_SEND_DATA: begin
+          // Send the captured data byte
+          uart_tx_data <= captured_data;
+          uart_tx_start <= 1;
+          uart_state <= UART_WAIT_DATA;
+        end
+
+        UART_WAIT_DATA: begin
+          uart_tx_start <= 0;
+          // Wait for UART to finish transmitting data byte
+          if (!uart_tx_busy && uart_tx_start == 0) begin
+            uart_state <= UART_IDLE;
+          end
+        end
+
+        default: uart_state <= UART_IDLE;
+      endcase
     end
   end
 
@@ -122,4 +202,16 @@ module tt_um_benpayne_ps2_decoder (
     .interupt(interupt),
     .int_clear(int_clear)
   );
+
+  uart_tx #(
+    .CLKS_PER_BIT(217)  // 25MHz / 115200 baud
+  ) uart_tx_inst (
+    .clk(clk),
+    .rst(~rst_n),
+    .tx_start(uart_tx_start),
+    .tx_data(uart_tx_data),
+    .tx(uart_tx),
+    .tx_busy(uart_tx_busy)
+  );
+
 endmodule

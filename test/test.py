@@ -684,3 +684,145 @@ async def test_variable_ps2_clock_slow(dut):
 
     value = await read_byte(dut)
     assert value == 0x88, f"Expected 0x88 with slow clock, got {value}"
+
+
+# ========================================
+# UART TX Test Helper Functions
+# ========================================
+
+async def uart_receive_byte(dut, timeout_us=1000):
+    """Receive one byte from UART TX line (115200 baud, 25 MHz clock)."""
+    # 115200 baud = 8.68 us per bit = 217 clock cycles @ 25 MHz
+    bit_time_ns = 8680  # 8.68 us in nanoseconds
+
+    # Wait for start bit (falling edge from idle high to 0)
+    start_time = cocotb.utils.get_sim_time(units='us')
+    while dut.uart_tx.value == 1:
+        await Timer(100, units="ns")
+        if cocotb.utils.get_sim_time(units='us') - start_time > timeout_us:
+            raise TimeoutError("UART start bit timeout")
+
+    # Wait to middle of start bit
+    await Timer(bit_time_ns // 2, units="ns")
+    assert dut.uart_tx.value == 0, "UART start bit must be 0"
+
+    # Read 8 data bits (LSB first)
+    data = 0
+    for i in range(8):
+        await Timer(bit_time_ns, units="ns")
+        bit = int(dut.uart_tx.value)
+        data |= (bit << i)
+
+    # Check stop bit
+    await Timer(bit_time_ns, units="ns")
+    assert dut.uart_tx.value == 1, "UART stop bit must be 1"
+
+    return data
+
+
+async def uart_receive_two_bytes(dut, timeout_us=2000):
+    """Receive two bytes from UART: status byte + data byte."""
+    status = await uart_receive_byte(dut, timeout_us)
+    data = await uart_receive_byte(dut, timeout_us)
+    return status, data
+
+
+# ========================================
+# UART TX Tests
+# ========================================
+
+@cocotb.test()
+async def test_uart_tx_single_byte(dut):
+    """Test UART TX sends status + data when PS/2 byte is received."""
+
+    dut.clear_int.value = 0
+    dut.cs.value = 0
+    dut.rst_n.value = 0
+    await Timer(1, units="us")
+    dut.rst_n.value = 1
+
+    cocotb.start_soon(Clock(dut.clk, 40, units="ns").start())
+
+    dut.ps2_clk.value = 1
+    dut.ps2_data.value = 1
+    await Timer(1, units="us")
+
+    # Send PS/2 byte 0xAB
+    cocotb.start_soon(send_bits(dut.ps2_clk, dut.ps2_data, 0xAB))
+
+    # Receive UART transmission
+    status, data = await uart_receive_two_bytes(dut)
+
+    # Verify status byte: bit 0 = valid (1), bit 1 = interrupt (1), bit 2 = data_rdy (1), bit 3 = fifo_full (0)
+    assert (status & 0x01) == 0x01, f"Valid bit should be set in status: {status:02x}"
+    assert (status & 0x02) == 0x02, f"Interrupt bit should be set in status: {status:02x}"
+    assert (status & 0x04) == 0x04, f"Data ready bit should be set in status: {status:02x}"
+    assert (status & 0x08) == 0x00, f"FIFO full bit should not be set in status: {status:02x}"
+
+    # Verify data byte matches PS/2 byte
+    assert data == 0xAB, f"Expected UART data 0xAB, got 0x{data:02x}"
+
+
+@cocotb.test()
+async def test_uart_tx_multiple_bytes(dut):
+    """Test UART TX sends multiple PS/2 bytes correctly."""
+
+    dut.clear_int.value = 0
+    dut.cs.value = 0
+    dut.rst_n.value = 0
+    await Timer(1, units="us")
+    dut.rst_n.value = 1
+
+    cocotb.start_soon(Clock(dut.clk, 40, units="ns").start())
+
+    dut.ps2_clk.value = 1
+    dut.ps2_data.value = 1
+    await Timer(1, units="us")
+
+    test_bytes = [0x1C, 0x23, 0x3A]
+
+    for test_byte in test_bytes:
+        # Send PS/2 byte
+        cocotb.start_soon(send_bits(dut.ps2_clk, dut.ps2_data, test_byte))
+
+        # Receive UART transmission
+        status, data = await uart_receive_two_bytes(dut, timeout_us=3000)
+
+        # Verify data byte
+        assert data == test_byte, f"Expected UART data 0x{test_byte:02x}, got 0x{data:02x}"
+
+        # Small delay between bytes
+        await Timer(50, units="us")
+
+
+@cocotb.test()
+async def test_uart_tx_fifo_full_status(dut):
+    """Test UART TX reports FIFO full status correctly."""
+
+    dut.clear_int.value = 0
+    dut.cs.value = 0
+    dut.rst_n.value = 0
+    await Timer(1, units="us")
+    dut.rst_n.value = 1
+
+    cocotb.start_soon(Clock(dut.clk, 40, units="ns").start())
+
+    dut.ps2_clk.value = 1
+    dut.ps2_data.value = 1
+    await Timer(1, units="us")
+
+    # Send 4 bytes to fill FIFO (capacity = 4)
+    for i in range(4):
+        cocotb.start_soon(send_bits(dut.ps2_clk, dut.ps2_data, 0x10 + i))
+        await RisingEdge(dut.valid)
+        await Timer(200, units="ns")
+
+    # Send 5th byte - should trigger FIFO full
+    cocotb.start_soon(send_bits(dut.ps2_clk, dut.ps2_data, 0x99))
+
+    # Receive UART transmission for 5th byte
+    status, data = await uart_receive_two_bytes(dut, timeout_us=3000)
+
+    # FIFO should be full (bit 3 = 1)
+    assert (status & 0x08) == 0x08, f"FIFO full bit should be set in status: {status:02x}"
+    assert data == 0x99, f"Expected UART data 0x99, got 0x{data:02x}"

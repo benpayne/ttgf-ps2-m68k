@@ -37,6 +37,7 @@ module tb ();
   wire cs;
   wire data_rdy;
   wire fifo_full;
+  wire uart_tx;
 
   assign ui_in[0] = ps2_clk;
   assign ui_in[1] = ps2_data;
@@ -47,6 +48,7 @@ module tb ();
   assign interupt = uo_out[1];
   assign data_rdy = uo_out[2];
   assign fifo_full = uo_out[3];
+  assign uart_tx = uo_out[4];
 
   // Replace tt_um_example with your module name:
   tt_um_benpayne_ps2_decoder user_project (
