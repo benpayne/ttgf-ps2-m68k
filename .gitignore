@@ -9,3 +9,7 @@ test/sim_build
 test/__pycache__/
 test/results.xml
 test/gate_level_netlist.v
+test/venv/
+test/*.log
+test/sky130_fd_sc_hd/
+test/output/
