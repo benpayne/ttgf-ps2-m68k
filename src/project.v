@@ -46,14 +46,16 @@ module tt_um_benpayne_ps2_decoder (
   wire uart_tx_busy;
 
   // UART transmission state machine
-  localparam UART_IDLE          = 3'd0;
-  localparam UART_CAPTURE_STATUS= 3'd1;
-  localparam UART_SEND_STATUS   = 3'd2;
-  localparam UART_WAIT_STATUS   = 3'd3;
-  localparam UART_SEND_DATA     = 3'd4;
-  localparam UART_WAIT_DATA     = 3'd5;
+  localparam UART_IDLE          = 4'd0;
+  localparam UART_DELAY1        = 4'd1;  // Wait for interrupt signal to settle
+  localparam UART_DELAY2        = 4'd2;  // Wait for FIFO full signal to settle
+  localparam UART_SEND_STATUS   = 4'd3;
+  localparam UART_WAIT_STATUS   = 4'd4;
+  localparam UART_PREP_DATA     = 4'd5;  // Prepare data byte (set uart_tx_data)
+  localparam UART_SEND_DATA     = 4'd6;  // Send data byte (pulse uart_tx_start)
+  localparam UART_WAIT_DATA     = 4'd7;
 
-  reg [2:0] uart_state;
+  reg [3:0] uart_state;
   reg [7:0] captured_status;
   reg [7:0] captured_data;
 
@@ -113,20 +115,25 @@ module tt_um_benpayne_ps2_decoder (
           if (valid) begin
             // Capture data immediately when valid pulses
             captured_data <= ps2_key_data;
-            // Move to capture status state to wait for interrupt/fifo signals to settle
-            uart_state <= UART_CAPTURE_STATUS;
+            // Wait 2 cycles for interrupt and fifo_full signals to fully settle
+            uart_state <= UART_DELAY1;
           end
         end
 
-        UART_CAPTURE_STATUS: begin
-          // Wait one cycle for interrupt and fifo_full signals to settle
+        UART_DELAY1: begin
+          // Cycle 1: interrupt signal gets set in ps2_decoder
+          uart_state <= UART_DELAY2;
+        end
+
+        UART_DELAY2: begin
+          // Cycle 2: FIFO full and other signals stable
+          // Set uart_tx_data to status byte NOW (before pulsing uart_tx_start)
+          uart_tx_data <= {4'b0, fifo_full, ~data_rdy, interupt, 1'b1};
           uart_state <= UART_SEND_STATUS;
         end
 
         UART_SEND_STATUS: begin
-          // Send the status byte (signals have now settled)
-          captured_status <= {4'b0, fifo_full, ~data_rdy, interupt, 1'b1};
-          uart_tx_data <= {4'b0, fifo_full, ~data_rdy, interupt, 1'b1};
+          // Pulse uart_tx_start (uart_tx_data was set in previous cycle)
           uart_tx_start <= 1;
           uart_state <= UART_WAIT_STATUS;
         end
@@ -134,14 +141,21 @@ module tt_um_benpayne_ps2_decoder (
         UART_WAIT_STATUS: begin
           uart_tx_start <= 0;
           // Wait for UART to finish transmitting status byte
-          if (!uart_tx_busy && uart_tx_start == 0) begin
-            uart_state <= UART_SEND_DATA;
+          // Once tx_busy goes low, UART has finished
+          if (!uart_tx_busy) begin
+            uart_state <= UART_PREP_DATA;
           end
         end
 
-        UART_SEND_DATA: begin
-          // Send the captured data byte
+        UART_PREP_DATA: begin
+          // Set uart_tx_data to the captured PS/2 data byte
+          // Wait one cycle for this to take effect before pulsing tx_start
           uart_tx_data <= captured_data;
+          uart_state <= UART_SEND_DATA;
+        end
+
+        UART_SEND_DATA: begin
+          // Now pulse tx_start (uart_tx_data is already set from prev cycle)
           uart_tx_start <= 1;
           uart_state <= UART_WAIT_DATA;
         end
@@ -149,7 +163,7 @@ module tt_um_benpayne_ps2_decoder (
         UART_WAIT_DATA: begin
           uart_tx_start <= 0;
           // Wait for UART to finish transmitting data byte
-          if (!uart_tx_busy && uart_tx_start == 0) begin
+          if (!uart_tx_busy) begin
             uart_state <= UART_IDLE;
           end
         end
